@@ -11,12 +11,16 @@ public class AllTalkUIController : MonoBehaviour
     public string serverBaseUrl = "http://127.0.0.1:7851"; // Default AllTalk port
     public string voiceFileName = "unity.wav";
 
+    [Header("Local Path Settings")]
+    // Point this directly to your local AllTalk voices folder
+    public string localVoicesFolderPath = @"C:\alltalk_tts\voices\";
+
     [Header("UI Components")]
     public Button startRecordingButton;
     public Button stopRecordingButton;
     public Button generateTTSButton;
     public TMP_InputField textInputField;
-    public TextMeshProUGUI statusText;
+    public TextMeshProUGUI statusText; // TMP Text for "Available" / "Unavailable"
     public AudioSource audioSource;
 
     [Header("Recording Settings")]
@@ -42,11 +46,11 @@ public class AllTalkUIController : MonoBehaviour
         if (stopRecordingButton != null) stopRecordingButton.onClick.AddListener(StopAndUploadRecording);
         if (generateTTSButton != null) generateTTSButton.onClick.AddListener(GenerateAndPlayTTS);
 
-        // Check if the voice file already exists on the server on startup
+        // Check if the voice file already exists on startup
         StartCoroutine(CheckVoiceAvailabilityRoutine());
     }
 
-    // Start Microphone Recording
+    // 1. Start Microphone Recording
     public void StartRecording()
     {
         if (!isMicrophoneInitialized) return;
@@ -56,7 +60,7 @@ public class AllTalkUIController : MonoBehaviour
         Debug.Log("Recording started...");
     }
 
-    // Stop Recording, convert to WAV and upload as "unity.wav"
+    // 2. Stop Recording, convert to WAV and save directly to AllTalk voices folder
     public void StopAndUploadRecording()
     {
         if (!isMicrophoneInitialized) return;
@@ -77,8 +81,21 @@ public class AllTalkUIController : MonoBehaviour
         // Convert AudioClip to WAV byte array using SaveWav helper
         byte[] wavBytes = SaveWav.GetWavBytes(trimmedClip);
 
-        // Upload to AllTalk and trigger server refresh
-        StartCoroutine(UploadVoiceRoutine(wavBytes, voiceFileName));
+        // Save directly to the local AllTalk directory
+        try
+        {
+            Directory.CreateDirectory(localVoicesFolderPath);
+            string fullPath = Path.Combine(localVoicesFolderPath, voiceFileName);
+            File.WriteAllBytes(fullPath, wavBytes);
+            Debug.Log("Voice successfully saved to: " + fullPath);
+
+            // Trigger AllTalk to reload its config and voices
+            StartCoroutine(ReloadAllTalkConfigRoutine());
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError("Failed to save voice file locally: " + e.Message);
+        }
     }
 
     // Helper method to trim the AudioClip duration
@@ -92,34 +109,28 @@ public class AllTalkUIController : MonoBehaviour
         return trimmed;
     }
 
-    // Upload routine and server refresh trigger
-    IEnumerator UploadVoiceRoutine(byte[] wavData, string fileName)
+    // Tell AllTalk server to reload configuration and refresh voices
+    IEnumerator ReloadAllTalkConfigRoutine()
     {
-        WWWForm form = new WWWForm();
-        form.AddBinaryData("file", wavData, fileName, "audio/wav");
-
-        using (UnityWebRequest www = UnityWebRequest.Post($"{serverBaseUrl}/api/refresh-voices", form))
+        using (UnityWebRequest www = UnityWebRequest.Get($"{serverBaseUrl}/api/reload_config"))
         {
             yield return www.SendWebRequest();
 
             if (www.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogError("Failed to upload voice: " + www.error);
+                Debug.LogError("Failed to reload AllTalk config: " + www.error);
             }
             else
             {
-                Debug.Log("Voice successfully uploaded as " + fileName);
-                // Update UI status to Available
+                Debug.Log("AllTalk config reloaded successfully!");
                 UpdateStatusText(true);
             }
         }
     }
 
-    // Check if "unity.wav" is available on the server
+    // 3. Check if "unity.wav" is available on the server via /api/voices
     IEnumerator CheckVoiceAvailabilityRoutine()
     {
-        // AllTalk provides voice lists via API or we can check via a lightweight request. 
-        // Alternatively, we query the voices endpoint.
         using (UnityWebRequest www = UnityWebRequest.Get($"{serverBaseUrl}/api/voices"))
         {
             yield return www.SendWebRequest();
@@ -148,7 +159,7 @@ public class AllTalkUIController : MonoBehaviour
         }
     }
 
-    // Generate TTS from TextField and play it immediately
+    // 4. Generate TTS from TextField and play it immediately
     public void GenerateAndPlayTTS()
     {
         if (textInputField == null || string.IsNullOrEmpty(textInputField.text))
@@ -166,12 +177,16 @@ public class AllTalkUIController : MonoBehaviour
         WWWForm form = new WWWForm();
         form.AddField("text_input", text);
         form.AddField("voice_select", voiceFileName);
-        form.AddField("language", "en"); // Change language if needed (e.g., "en", "de, "ru")
+        form.AddField("language", "de"); // Change language if needed (e.g., "en", "ru")
         form.AddField("temperature", "0.7");
         form.AddField("speed", "1.0");
 
+        // Create a POST request with form data and attach a dedicated DownloadHandlerAudioClip to parse the incoming WAV stream
         using (UnityWebRequest www = UnityWebRequest.Post($"{serverBaseUrl}/api/tts-generate", form))
         {
+            // Set the download handler to parse the incoming binary data directly as a WAV AudioClip
+            www.downloadHandler = new DownloadHandlerAudioClip($"{serverBaseUrl}/api/tts-generate", AudioType.WAV);
+
             yield return www.SendWebRequest();
 
             if (www.result != UnityWebRequest.Result.Success)
@@ -180,9 +195,8 @@ public class AllTalkUIController : MonoBehaviour
             }
             else
             {
-                // Load AudioClip directly from download handler response
-                DownloadHandlerAudioClip audioHandler = (DownloadHandlerAudioClip)www.downloadHandler;
-                AudioClip clip = audioHandler.audioClip;
+                // Retrieve the decoded AudioClip from the custom download handler
+                AudioClip clip = ((DownloadHandlerAudioClip)www.downloadHandler).audioClip;
 
                 if (clip != null && audioSource != null)
                 {
