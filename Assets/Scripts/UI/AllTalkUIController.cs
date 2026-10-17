@@ -5,6 +5,15 @@ using UnityEngine.UI;
 using UnityEngine.Networking;
 using TMPro;
 
+[System.Serializable]
+public class AllTalkTTSResponse
+{
+    public string status;
+    public string output_file_path;
+    public string output_file_url;
+    public string output_cache_url;
+}
+
 public class AllTalkUIController : MonoBehaviour
 {
     [Header("API Settings")]
@@ -172,43 +181,132 @@ public class AllTalkUIController : MonoBehaviour
         StartCoroutine(GenerateAndPlayTTSRoutine(textToSpeak));
     }
 
+
     IEnumerator GenerateAndPlayTTSRoutine(string text)
     {
+        if (audioSource == null)
+        {
+            Debug.LogError("AllTalk: No AudioSource assigned!");
+            yield break;
+        }
+
+        // 1. Request für die TTS-Generierung erstellen.
         WWWForm form = new WWWForm();
+
         form.AddField("text_input", text);
-        form.AddField("voice_select", voiceFileName);
-        form.AddField("language", "de"); // Change language if needed (e.g., "en", "ru")
+        form.AddField("text_filtering", "standard");
+        form.AddField("character_voice_gen", voiceFileName);
+        form.AddField("narrator_enabled", "false");
+        form.AddField("narrator_voice_gen", voiceFileName);
+        form.AddField("text_not_inside", "character");
+        form.AddField("language", "de");
+
         form.AddField("temperature", "0.7");
         form.AddField("speed", "1.0");
 
-        // Create a POST request with form data and attach a dedicated DownloadHandlerAudioClip to parse the incoming WAV stream
-        using (UnityWebRequest www = UnityWebRequest.Post($"{serverBaseUrl}/api/tts-generate", form))
+        form.AddField("output_file_name", "unity_tts");
+        form.AddField("output_file_timestamp", "true");
+        form.AddField("autoplay", "false");
+        form.AddField("autoplay_volume", "0.8");
+
+        string baseUrl = serverBaseUrl.TrimEnd('/');
+        string apiUrl = baseUrl + "/api/tts-generate";
+
+        // 2. Erst die JSON-Antwort der API abrufen.
+        using (UnityWebRequest request =
+               UnityWebRequest.Post(apiUrl, form))
         {
-            // Set the download handler to parse the incoming binary data directly as a WAV AudioClip
-            www.downloadHandler = new DownloadHandlerAudioClip($"{serverBaseUrl}/api/tts-generate", AudioType.WAV);
+            yield return request.SendWebRequest();
 
-            yield return www.SendWebRequest();
-
-            if (www.result != UnityWebRequest.Result.Success)
+            if (request.result != UnityWebRequest.Result.Success)
             {
-                Debug.LogError("TTS Generation Error: " + www.error);
+                Debug.LogError(
+                    "AllTalk generation request failed: "
+                    + request.error
+                    + "\nResponse: "
+                    + request.downloadHandler.text
+                );
+                yield break;
+            }
+
+            string json = request.downloadHandler.text;
+            Debug.Log("AllTalk response: " + json);
+
+            AllTalkTTSResponse response =
+                JsonUtility.FromJson<AllTalkTTSResponse>(json);
+
+            if (response == null ||
+                response.status != "generate-success" ||
+                string.IsNullOrEmpty(response.output_file_url))
+            {
+                Debug.LogError(
+                    "AllTalk did not return a valid audio URL. "
+                    + "Response: " + json
+                );
+                yield break;
+            }
+
+            // 3. Die URL zur echten WAV-Datei bestimmen.
+            string audioUrl;
+
+            if (response.output_file_url.StartsWith(
+                    "http://",
+                    System.StringComparison.OrdinalIgnoreCase) ||
+                response.output_file_url.StartsWith(
+                    "https://",
+                    System.StringComparison.OrdinalIgnoreCase))
+            {
+                audioUrl = response.output_file_url;
             }
             else
             {
-                // Retrieve the decoded AudioClip from the custom download handler
-                AudioClip clip = ((DownloadHandlerAudioClip)www.downloadHandler).audioClip;
+                audioUrl = baseUrl + "/"
+                    + response.output_file_url.TrimStart('/');
+            }
 
-                if (clip != null && audioSource != null)
+            Debug.Log("Downloading TTS audio: " + audioUrl);
+
+            // 4. Die WAV-Datei separat herunterladen und dekodieren.
+            using (UnityWebRequest audioRequest =
+                   UnityWebRequestMultimedia.GetAudioClip(
+                       audioUrl, AudioType.WAV))
+            {
+                yield return audioRequest.SendWebRequest();
+
+                if (audioRequest.result !=
+                    UnityWebRequest.Result.Success)
                 {
-                    audioSource.clip = clip;
-                    audioSource.Play();
-                    Debug.Log("TTS generated and playing successfully!");
+                    Debug.LogError(
+                        "Failed to download/decode WAV: "
+                        + audioRequest.error
+                        + "\nURL: " + audioUrl
+                    );
+                    yield break;
                 }
-                else
+
+                AudioClip clip =
+                    DownloadHandlerAudioClip.GetContent(audioRequest);
+
+                if (clip == null)
                 {
-                    Debug.LogError("Failed to load AudioClip from TTS response.");
+                    Debug.LogError(
+                        "AudioClip could not be decoded. URL: "
+                        + audioUrl
+                    );
+                    yield break;
                 }
+
+                // 5. Das erzeugte Audio abspielen.
+                audioSource.Stop();
+                audioSource.clip = clip;
+                audioSource.Play();
+
+                Debug.Log(
+                    "AllTalk TTS playing. Duration: "
+                    + clip.length + " seconds."
+                );
             }
         }
     }
+
 }
