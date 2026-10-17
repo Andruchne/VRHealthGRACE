@@ -1,218 +1,212 @@
-//	Copyright (c) 2012 Calvin Rien
-//        http://the.darktable.com
-//
-//	This software is provided 'as-is', without any express or implied warranty. In
-//	no event will the authors be held liable for any damages arising from the use
-//	of this software.
-//
-//	Permission is granted to anyone to use this software for any purpose,
-//	including commercial applications, and to alter it and redistribute it freely,
-//	subject to the following restrictions:
-//
-//	1. The origin of this software must not be misrepresented; you must not claim
-//	that you wrote the original software. If you use this software in a product,
-//	an acknowledgment in the product documentation would be appreciated but is not
-//	required.
-//
-//	2. Altered source versions must be plainly marked as such, and must not be
-//	misrepresented as being the original software.
-//
-//	3. This notice may not be removed or altered from any source distribution.
-//
-//  =============================================================================
-//
-//  derived from Gregorio Zanon's script
-//  http://forum.unity3d.com/threads/119295-Writing-AudioListener.GetOutputData-to-wav-problem?p=806734&viewfull=1#post806734
-
 using System;
+using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
-using System.Collections.Generic;
 
+/// <summary>
+/// Encodes Unity AudioClips as 16-bit PCM WAV data.
+/// </summary>
 public static class SaveWav
 {
-    const int HEADER_SIZE = 44;
+    private const int HeaderSize = 44;
 
-    // NEU: Gibt das Audio direkt als Byte-Array im Speicher zurück (ideal für WebRequests)
     public static byte[] GetWavBytes(AudioClip clip)
     {
-        using (var memoryStream = new MemoryStream())
+        if (clip == null)
         {
-            // Platzhalter für den Header schreiben
-            for (int i = 0; i < HEADER_SIZE; i++)
+            throw new ArgumentNullException(nameof(clip));
+        }
+
+        using (MemoryStream stream = new MemoryStream())
+        {
+            for (int i = 0; i < HeaderSize; i++)
             {
-                memoryStream.WriteByte(0);
+                stream.WriteByte(0);
             }
 
-            // Audiodaten konvertieren und schreiben
-            ConvertAndWriteToStream(memoryStream, clip);
+            WritePcmData(stream, clip);
+            long endPosition = stream.Position;
+            long dataLength = endPosition - HeaderSize;
 
-            // Header mit den korrekten Längeninformationen am Anfang schreiben
-            WriteHeaderToStream(memoryStream, clip);
-
-            return memoryStream.ToArray();
+            stream.Position = 0;
+            WriteHeader(stream, clip, dataLength);
+            stream.Position = endPosition;
+            return stream.ToArray();
         }
     }
 
     public static bool Save(string filename, AudioClip clip)
     {
-        if (!filename.ToLower().EndsWith(".wav"))
+        if (string.IsNullOrWhiteSpace(filename))
+        {
+            throw new ArgumentException("A filename is required.", nameof(filename));
+        }
+
+        if (!filename.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
         {
             filename += ".wav";
         }
 
-        var filepath = Path.Combine(Application.persistentDataPath, filename);
-
-        Debug.Log(filepath);
-
-        // Make sure directory exists if user is saving to sub dir.
-        Directory.CreateDirectory(Path.GetDirectoryName(filepath));
-
-        using (var fileStream = CreateEmpty(filepath))
+        string filePath = Path.Combine(Application.persistentDataPath, filename);
+        string directory = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrEmpty(directory))
         {
-            ConvertAndWrite(fileStream, clip);
-            WriteHeader(fileStream, clip);
+            Directory.CreateDirectory(directory);
         }
 
+        File.WriteAllBytes(filePath, GetWavBytes(clip));
+        Debug.Log("WAV saved to: " + filePath);
         return true;
     }
 
-    public static AudioClip TrimSilence(AudioClip clip, float min)
+    public static AudioClip TrimSilence(AudioClip clip, float threshold)
     {
-        var samples = new float[clip.samples];
-        clip.GetData(samples, 0);
-        return TrimSilence(new List<float>(samples), min, clip.channels, clip.frequency);
-    }
-
-    public static AudioClip TrimSilence(List<float> samples, float min, int channels, int hz)
-    {
-        return TrimSilence(samples, min, channels, hz, false, false);
-    }
-
-    public static AudioClip TrimSilence(List<float> samples, float min, int channels, int hz, bool _3D, bool stream)
-    {
-        int i;
-
-        for (i = 0; i < samples.Count; i++)
+        if (clip == null)
         {
-            if (Mathf.Abs(samples[i]) > min)
+            throw new ArgumentNullException(nameof(clip));
+        }
+
+        float[] samples = new float[clip.samples * clip.channels];
+        clip.GetData(samples, 0);
+        return TrimSilence(new List<float>(samples), threshold, clip.channels, clip.frequency);
+    }
+
+    public static AudioClip TrimSilence(List<float> samples, float threshold, int channels, int sampleRate)
+    {
+        return TrimSilence(samples, threshold, channels, sampleRate, false, false);
+    }
+
+    public static AudioClip TrimSilence(
+        List<float> samples,
+        float threshold,
+        int channels,
+        int sampleRate,
+        bool is3D,
+        bool stream)
+    {
+        if (samples == null || samples.Count == 0)
+        {
+            throw new ArgumentException("Audio samples cannot be empty.", nameof(samples));
+        }
+
+        channels = Mathf.Max(1, channels);
+        int frameCount = samples.Count / channels;
+        if (frameCount <= 0)
+        {
+            throw new ArgumentException("The sample count is smaller than the channel count.", nameof(samples));
+        }
+
+        int firstFrame = 0;
+        int lastFrame = frameCount - 1;
+        bool containsAudio = false;
+
+        for (int frame = 0; frame < frameCount; frame++)
+        {
+            bool frameHasAudio = false;
+            for (int channel = 0; channel < channels; channel++)
             {
+                if (Mathf.Abs(samples[frame * channels + channel]) > threshold)
+                {
+                    frameHasAudio = true;
+                    containsAudio = true;
+                    break;
+                }
+            }
+
+            if (frameHasAudio)
+            {
+                firstFrame = frame;
                 break;
             }
         }
 
-        samples.RemoveRange(0, i);
-
-        for (i = samples.Count - 1; i > 0; i--)
+        if (containsAudio)
         {
-            if (Mathf.Abs(samples[i]) > min)
+            for (int frame = frameCount - 1; frame >= firstFrame; frame--)
             {
-                break;
+                bool frameHasAudio = false;
+                for (int channel = 0; channel < channels; channel++)
+                {
+                    if (Mathf.Abs(samples[frame * channels + channel]) > threshold)
+                    {
+                        frameHasAudio = true;
+                        break;
+                    }
+                }
+
+                if (frameHasAudio)
+                {
+                    lastFrame = frame;
+                    break;
+                }
             }
         }
-
-        samples.RemoveRange(i, samples.Count - i);
-
-        var clip = AudioClip.Create("TempClip", samples.Count, channels, hz, _3D, stream);
-        clip.SetData(samples.ToArray(), 0);
-
-        return clip;
-    }
-
-    static FileStream CreateEmpty(string filepath)
-    {
-        var fileStream = new FileStream(filepath, FileMode.Create);
-        byte emptyByte = new byte();
-
-        for (int i = 0; i < HEADER_SIZE; i++) //preparing the header
+        else
         {
-            fileStream.WriteByte(emptyByte);
+            firstFrame = 0;
+            lastFrame = frameCount - 1;
         }
 
-        return fileStream;
+        int firstSample = firstFrame * channels;
+        int sampleLength = (lastFrame - firstFrame + 1) * channels;
+        float[] trimmedSamples = samples.GetRange(firstSample, sampleLength).ToArray();
+        int trimmedFrameCount = Mathf.Max(1, trimmedSamples.Length / channels);
+        AudioClip trimmedClip = AudioClip.Create("TrimmedAudio", trimmedFrameCount, channels, sampleRate, is3D, stream);
+        trimmedClip.SetData(trimmedSamples, 0);
+        return trimmedClip;
     }
 
-    static void ConvertAndWrite(FileStream fileStream, AudioClip clip)
+    private static void WritePcmData(Stream stream, AudioClip clip)
     {
-        ConvertAndWriteToStream(fileStream, clip);
-    }
-
-    // Hilfsmethode, um den Stream-Code für Datei und Memory Stream zu teilen
-    static void ConvertAndWriteToStream(Stream stream, AudioClip clip)
-    {
-        var samples = new float[clip.samples];
-        clip.GetData(samples, 0);
-
-        Int16[] intData = new Int16[samples.Length];
-        Byte[] bytesData = new Byte[samples.Length * 2];
-        int rescaleFactor = 32767;
+        float[] samples = new float[clip.samples * clip.channels];
+        if (!clip.GetData(samples, 0))
+        {
+            throw new InvalidOperationException("Unity could not read audio samples from the AudioClip.");
+        }
 
         for (int i = 0; i < samples.Length; i++)
         {
-            intData[i] = (short)(samples[i] * rescaleFactor);
-            Byte[] byteArr = new Byte[2];
-            byteArr = BitConverter.GetBytes(intData[i]);
-            byteArr.CopyTo(bytesData, i * 2);
+            int pcmValue = Mathf.Clamp(Mathf.RoundToInt(samples[i] * 32767f), short.MinValue, short.MaxValue);
+            short pcmSample = (short)pcmValue;
+            stream.WriteByte((byte)(pcmSample & 0xff));
+            stream.WriteByte((byte)((pcmSample >> 8) & 0xff));
         }
-
-        stream.Write(bytesData, 0, bytesData.Length);
     }
 
-    static void WriteHeader(FileStream fileStream, AudioClip clip)
+    private static void WriteHeader(Stream stream, AudioClip clip, long dataLength)
     {
-        WriteHeaderToStream(fileStream, clip);
+        WriteFourCc(stream, "RIFF");
+        WriteInt32LE(stream, checked((int)(36 + dataLength)));
+        WriteFourCc(stream, "WAVE");
+        WriteFourCc(stream, "fmt ");
+        WriteInt32LE(stream, 16);
+        WriteInt16LE(stream, 1);
+        WriteInt16LE(stream, (short)clip.channels);
+        WriteInt32LE(stream, clip.frequency);
+        WriteInt32LE(stream, checked(clip.frequency * clip.channels * 2));
+        WriteInt16LE(stream, (short)(clip.channels * 2));
+        WriteInt16LE(stream, 16);
+        WriteFourCc(stream, "data");
+        WriteInt32LE(stream, checked((int)dataLength));
     }
 
-    // Hilfsmethode, um den Header-Code für Datei und Memory Stream zu teilen
-    static void WriteHeaderToStream(Stream stream, AudioClip clip)
+    private static void WriteFourCc(Stream stream, string value)
     {
-        var hz = clip.frequency;
-        var channels = clip.channels;
-        var samples = clip.samples;
+        byte[] bytes = System.Text.Encoding.ASCII.GetBytes(value);
+        stream.Write(bytes, 0, bytes.Length);
+    }
 
-        stream.Seek(0, SeekOrigin.Begin);
+    private static void WriteInt16LE(Stream stream, short value)
+    {
+        stream.WriteByte((byte)(value & 0xff));
+        stream.WriteByte((byte)((value >> 8) & 0xff));
+    }
 
-        Byte[] riff = System.Text.Encoding.UTF8.GetBytes("RIFF");
-        stream.Write(riff, 0, 4);
-
-        Byte[] chunkSize = BitConverter.GetBytes(stream.Length - 8);
-        stream.Write(chunkSize, 0, 4);
-
-        Byte[] wave = System.Text.Encoding.UTF8.GetBytes("WAVE");
-        stream.Write(wave, 0, 4);
-
-        Byte[] fmt = System.Text.Encoding.UTF8.GetBytes("fmt ");
-        stream.Write(fmt, 0, 4);
-
-        Byte[] subChunk1 = BitConverter.GetBytes(16);
-        stream.Write(subChunk1, 0, 4);
-
-        UInt16 two = 2;
-        UInt16 one = 1;
-
-        Byte[] audioFormat = BitConverter.GetBytes(one);
-        stream.Write(audioFormat, 0, 2);
-
-        Byte[] numChannels = BitConverter.GetBytes(channels);
-        stream.Write(numChannels, 0, 2);
-
-        Byte[] sampleRate = BitConverter.GetBytes(hz);
-        stream.Write(sampleRate, 0, 4);
-
-        Byte[] byteRate = BitConverter.GetBytes(hz * channels * 2);
-        stream.Write(byteRate, 0, 4);
-
-        UInt16 blockAlign = (ushort)(channels * 2);
-        stream.Write(BitConverter.GetBytes(blockAlign), 0, 2);
-
-        UInt16 bps = 16;
-        Byte[] bitsPerSample = BitConverter.GetBytes(bps);
-        stream.Write(bitsPerSample, 0, 2);
-
-        Byte[] datastring = System.Text.Encoding.UTF8.GetBytes("data");
-        stream.Write(datastring, 0, 4);
-
-        Byte[] subChunk2 = BitConverter.GetBytes(samples * channels * 2);
-        stream.Write(subChunk2, 0, 4);
+    private static void WriteInt32LE(Stream stream, int value)
+    {
+        stream.WriteByte((byte)(value & 0xff));
+        stream.WriteByte((byte)((value >> 8) & 0xff));
+        stream.WriteByte((byte)((value >> 16) & 0xff));
+        stream.WriteByte((byte)((value >> 24) & 0xff));
     }
 }

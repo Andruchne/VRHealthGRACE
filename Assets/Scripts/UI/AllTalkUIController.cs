@@ -1,312 +1,460 @@
+using System;
 using System.Collections;
 using System.IO;
-using UnityEngine;
-using UnityEngine.UI;
-using UnityEngine.Networking;
 using TMPro;
+using UnityEngine;
+using UnityEngine.Networking;
+using UnityEngine.UI;
 
-[System.Serializable]
-public class AllTalkTTSResponse
-{
-    public string status;
-    public string output_file_path;
-    public string output_file_url;
-    public string output_cache_url;
-}
-
+/// <summary>
+/// Connects the UI to microphone recording, voice-file saving, and TTS playback.
+/// HTTP requests are delegated to AllTalkApiClient and speech playback to AllTalkTTSPlayer.
+/// </summary>
 public class AllTalkUIController : MonoBehaviour
 {
-    [Header("API Settings")]
-    public string serverBaseUrl = "http://127.0.0.1:7851"; // Default AllTalk port
-    public string voiceFileName = "unity.wav";
+    [Header("Dependencies")]
+    public AllTalkApiClient apiClient;
+    public AllTalkTTSPlayer ttsPlayer;
 
-    [Header("Local Path Settings")]
-    // Point this directly to your local AllTalk voices folder
+    [Header("Voice Settings")]
+    public string voiceFileName = "unity.wav";
     public string localVoicesFolderPath = @"C:\alltalk_tts\voices\";
+    public string ttsLanguage = "de";
 
     [Header("UI Components")]
-    public Button startRecordingButton;
-    public Button stopRecordingButton;
+    public Button recordButton;
+    public TMP_Text recordButtonLabel;
+    public Image recordButtonImage;
+    public Slider recordingProgressSlider;
     public Button generateTTSButton;
     public TMP_InputField textInputField;
-    public TextMeshProUGUI statusText; // TMP Text for "Available" / "Unavailable"
-    public AudioSource audioSource;
+    public TMP_Text statusText;
 
     [Header("Recording Settings")]
+    [Min(1)] public int maxRecordingSeconds = 10;
+    [Min(8000)] public int recordingSampleRate = 22050;
+    public Color recordingButtonColor = new Color(0.85f, 0.12f, 0.12f, 1f);
+    public string idleButtonLabel = "Record Voice";
+    public string recordingButtonLabelText = "Stop & Save";
+
     private AudioClip recordedAudio;
     private string microphoneID;
-    private bool isMicrophoneInitialized = false;
+    private bool isMicrophoneInitialized;
+    private bool isRecording;
+    private bool isSavingVoice;
+    private float recordingElapsed;
+    private Color idleButtonColor = Color.white;
 
-    void Start()
+    private void Awake()
     {
-        // Initialize Microphone
-        if (Microphone.devices.Length > 0)
+        if (apiClient == null)
         {
-            microphoneID = Microphone.devices[0];
-            isMicrophoneInitialized = true;
-        }
-        else
-        {
-            Debug.LogError("No microphone device found on this system!");
+            apiClient = GetComponent<AllTalkApiClient>();
         }
 
-        // Setup Button Listeners
-        if (startRecordingButton != null) startRecordingButton.onClick.AddListener(StartRecording);
-        if (stopRecordingButton != null) stopRecordingButton.onClick.AddListener(StopAndUploadRecording);
-        if (generateTTSButton != null) generateTTSButton.onClick.AddListener(GenerateAndPlayTTS);
+        if (ttsPlayer == null)
+        {
+            ttsPlayer = GetComponent<AllTalkTTSPlayer>();
+        }
+    }
 
-        // Check if the voice file already exists on startup
+    private void Start()
+    {
+        InitializeMicrophone();
+        ConfigureRecordingUI();
+
+        if (recordButton != null)
+        {
+            recordButton.onClick.AddListener(ToggleRecording);
+        }
+
+        if (generateTTSButton != null)
+        {
+            generateTTSButton.onClick.AddListener(GenerateAndPlayTTS);
+        }
+
+        if (apiClient == null)
+        {
+            Debug.LogError("AllTalkUIController: Assign an AllTalkApiClient component.");
+            SetStatus("AllTalk client missing");
+            return;
+        }
+
         StartCoroutine(CheckVoiceAvailabilityRoutine());
     }
 
-    // 1. Start Microphone Recording
-    public void StartRecording()
+    private void Update()
     {
-        if (!isMicrophoneInitialized) return;
-
-        // Record up to 10 seconds at 22050 Hz
-        recordedAudio = Microphone.Start(microphoneID, false, 10, 22050);
-        Debug.Log("Recording started...");
-    }
-
-    // 2. Stop Recording, convert to WAV and save directly to AllTalk voices folder
-    public void StopAndUploadRecording()
-    {
-        if (!isMicrophoneInitialized) return;
-
-        int recordedSamples = Microphone.GetPosition(microphoneID);
-        Microphone.End(microphoneID);
-        Debug.Log("Recording stopped. Processing audio...");
-
-        if (recordedSamples <= 0)
+        if (!isRecording)
         {
-            Debug.LogWarning("No audio data recorded.");
             return;
         }
 
-        // Trim the AudioClip to the actual recorded length
-        AudioClip trimmedClip = TrimAudioClip(recordedAudio, recordedSamples);
+        recordingElapsed += Time.unscaledDeltaTime;
 
-        // Convert AudioClip to WAV byte array using SaveWav helper
-        byte[] wavBytes = SaveWav.GetWavBytes(trimmedClip);
+        if (recordingProgressSlider != null)
+        {
+            recordingProgressSlider.value = Mathf.Clamp01(recordingElapsed / maxRecordingSeconds);
+        }
 
-        // Save directly to the local AllTalk directory
+        if (recordingElapsed >= maxRecordingSeconds)
+        {
+            StopRecordingAndSave(true);
+        }
+    }
+
+    public void ToggleRecording()
+    {
+        if (isSavingVoice)
+        {
+            return;
+        }
+
+        if (isRecording)
+        {
+            StopRecordingAndSave(false);
+        }
+        else
+        {
+            StartRecording();
+        }
+    }
+
+    public void StartRecording()
+    {
+        if (!isMicrophoneInitialized || string.IsNullOrEmpty(microphoneID))
+        {
+            SetStatus("No microphone available");
+            Debug.LogWarning("AllTalkUIController: Cannot record because no microphone is available.");
+            return;
+        }
+
+        if (isRecording || isSavingVoice)
+        {
+            return;
+        }
+
+        recordedAudio = Microphone.Start(microphoneID, false, maxRecordingSeconds, recordingSampleRate);
+        if (recordedAudio == null)
+        {
+            SetStatus("Could not start microphone");
+            Debug.LogError("AllTalkUIController: Microphone.Start returned no AudioClip.");
+            return;
+        }
+
+        isRecording = true;
+        recordingElapsed = 0f;
+
+        if (recordingProgressSlider != null)
+        {
+            recordingProgressSlider.value = 0f;
+            recordingProgressSlider.gameObject.SetActive(true);
+        }
+
+        UpdateRecordingButton(true);
+        SetStatus("Recording...");
+        Debug.Log("AllTalk voice recording started.");
+    }
+
+    private void StopRecordingAndSave(bool reachedTimeLimit)
+    {
+        if (!isRecording)
+        {
+            return;
+        }
+
+        int recordedSamples = 0;
+        bool microphoneStillRecording = !string.IsNullOrEmpty(microphoneID) && Microphone.IsRecording(microphoneID);
+
+        if (!string.IsNullOrEmpty(microphoneID))
+        {
+            recordedSamples = Microphone.GetPosition(microphoneID);
+
+            if (microphoneStillRecording)
+            {
+                Microphone.End(microphoneID);
+            }
+        }
+
+        isRecording = false;
+        UpdateRecordingButton(false);
+
+        if (recordingProgressSlider != null)
+        {
+            recordingProgressSlider.value = 0f;
+            recordingProgressSlider.gameObject.SetActive(false);
+        }
+
+        if (recordedAudio == null)
+        {
+            SetStatus("No audio recorded");
+            Debug.LogWarning("AllTalkUIController: The recording AudioClip is missing.");
+            return;
+        }
+
+        if (reachedTimeLimit && (recordedSamples <= 0 || !microphoneStillRecording))
+        {
+            recordedSamples = recordedAudio.samples;
+        }
+
+        recordedSamples = Mathf.Clamp(recordedSamples, 0, recordedAudio.samples);
+        if (recordedSamples <= 0)
+        {
+            SetStatus("No audio recorded");
+            Debug.LogWarning("AllTalkUIController: No microphone samples were captured.");
+            Destroy(recordedAudio);
+            recordedAudio = null;
+            return;
+        }
+
+        AudioClip trimmedClip = null;
+        byte[] wavBytes;
+
+        try
+        {
+            trimmedClip = TrimAudioClip(recordedAudio, recordedSamples);
+            wavBytes = SaveWav.GetWavBytes(trimmedClip);
+        }
+        catch (Exception exception)
+        {
+            SetStatus("Could not process recording");
+            Debug.LogError("AllTalkUIController: Failed to process microphone audio: " + exception.Message);
+            if (trimmedClip != null) Destroy(trimmedClip);
+            Destroy(recordedAudio);
+            recordedAudio = null;
+            return;
+        }
+
+        if (trimmedClip != null) Destroy(trimmedClip);
+        Destroy(recordedAudio);
+        recordedAudio = null;
+
+        isSavingVoice = true;
+        if (recordButton != null) recordButton.interactable = false;
+        SetStatus("Saving voice...");
+        StartCoroutine(SaveVoiceAndRefreshRoutine(wavBytes));
+    }
+
+    private AudioClip TrimAudioClip(AudioClip sourceClip, int lengthSamples)
+    {
+        if (sourceClip == null)
+        {
+            throw new ArgumentNullException(nameof(sourceClip));
+        }
+
+        lengthSamples = Mathf.Clamp(lengthSamples, 1, sourceClip.samples);
+        int channels = sourceClip.channels;
+        float[] data = new float[lengthSamples * channels];
+
+        if (!sourceClip.GetData(data, 0))
+        {
+            throw new InvalidOperationException("Unity could not read the recorded audio data.");
+        }
+
+        AudioClip trimmedClip = AudioClip.Create(
+            sourceClip.name + "_trimmed",
+            lengthSamples,
+            channels,
+            sourceClip.frequency,
+            false);
+
+        if (!trimmedClip.SetData(data, 0))
+        {
+            Destroy(trimmedClip);
+            throw new InvalidOperationException("Unity could not copy the recorded audio data.");
+        }
+
+        return trimmedClip;
+    }
+
+    private IEnumerator SaveVoiceAndRefreshRoutine(byte[] wavBytes)
+    {
+        string fullPath;
+
         try
         {
             Directory.CreateDirectory(localVoicesFolderPath);
-            string fullPath = Path.Combine(localVoicesFolderPath, voiceFileName);
+            string safeFileName = Path.GetFileName(voiceFileName);
+            if (string.IsNullOrWhiteSpace(safeFileName))
+            {
+                throw new InvalidOperationException("Voice filename is empty.");
+            }
+
+            fullPath = Path.Combine(localVoicesFolderPath, safeFileName);
             File.WriteAllBytes(fullPath, wavBytes);
-            Debug.Log("Voice successfully saved to: " + fullPath);
-
-            // Trigger AllTalk to reload its config and voices
-            StartCoroutine(ReloadAllTalkConfigRoutine());
+            Debug.Log("AllTalk voice saved to: " + fullPath);
         }
-        catch (System.Exception e)
+        catch (Exception exception)
         {
-            Debug.LogError("Failed to save voice file locally: " + e.Message);
-        }
-    }
-
-    // Helper method to trim the AudioClip duration
-    private AudioClip TrimAudioClip(AudioClip originalClip, int lengthSamples)
-    {
-        float[] data = new float[lengthSamples * originalClip.channels];
-        originalClip.GetData(data, 0);
-
-        AudioClip trimmed = AudioClip.Create(originalClip.name, lengthSamples, originalClip.channels, originalClip.frequency, false);
-        trimmed.SetData(data, 0);
-        return trimmed;
-    }
-
-    // Tell AllTalk server to reload configuration and refresh voices
-    IEnumerator ReloadAllTalkConfigRoutine()
-    {
-        using (UnityWebRequest www = UnityWebRequest.Get($"{serverBaseUrl}/api/reload_config"))
-        {
-            yield return www.SendWebRequest();
-
-            if (www.result != UnityWebRequest.Result.Success)
-            {
-                Debug.LogError("Failed to reload AllTalk config: " + www.error);
-            }
-            else
-            {
-                Debug.Log("AllTalk config reloaded successfully!");
-                UpdateStatusText(true);
-            }
-        }
-    }
-
-    // 3. Check if "unity.wav" is available on the server via /api/voices
-    IEnumerator CheckVoiceAvailabilityRoutine()
-    {
-        using (UnityWebRequest www = UnityWebRequest.Get($"{serverBaseUrl}/api/voices"))
-        {
-            yield return www.SendWebRequest();
-
-            if (www.result != UnityWebRequest.Result.Success)
-            {
-                Debug.LogWarning("Could not fetch voices from server. Setting status to Unavailable.");
-                UpdateStatusText(false);
-            }
-            else
-            {
-                string jsonResponse = www.downloadHandler.text;
-                // Check if response contains our target voice file
-                bool isAvailable = jsonResponse.Contains(voiceFileName);
-                UpdateStatusText(isAvailable);
-            }
-        }
-    }
-
-    // Update TMP Text based on availability
-    private void UpdateStatusText(bool available)
-    {
-        if (statusText != null)
-        {
-            statusText.text = available ? "Available" : "Unavailable";
-        }
-    }
-
-    // 4. Generate TTS from TextField and play it immediately
-    public void GenerateAndPlayTTS()
-    {
-        if (textInputField == null || string.IsNullOrEmpty(textInputField.text))
-        {
-            Debug.LogWarning("Text field is empty!");
-            return;
-        }
-
-        string textToSpeak = textInputField.text;
-        StartCoroutine(GenerateAndPlayTTSRoutine(textToSpeak));
-    }
-
-
-    IEnumerator GenerateAndPlayTTSRoutine(string text)
-    {
-        if (audioSource == null)
-        {
-            Debug.LogError("AllTalk: No AudioSource assigned!");
+            Debug.LogError("Failed to save the voice file: " + exception.Message);
+            SetStatus("Failed to save voice");
+            FinishSavingVoice();
             yield break;
         }
 
-        // 1. Request für die TTS-Generierung erstellen.
-        WWWForm form = new WWWForm();
-
-        form.AddField("text_input", text);
-        form.AddField("text_filtering", "standard");
-        form.AddField("character_voice_gen", voiceFileName);
-        form.AddField("narrator_enabled", "false");
-        form.AddField("narrator_voice_gen", voiceFileName);
-        form.AddField("text_not_inside", "character");
-        form.AddField("language", "de");
-
-        form.AddField("temperature", "0.7");
-        form.AddField("speed", "1.0");
-
-        form.AddField("output_file_name", "unity_tts");
-        form.AddField("output_file_timestamp", "true");
-        form.AddField("autoplay", "false");
-        form.AddField("autoplay_volume", "0.8");
-
-        string baseUrl = serverBaseUrl.TrimEnd('/');
-        string apiUrl = baseUrl + "/api/tts-generate";
-
-        // 2. Erst die JSON-Antwort der API abrufen.
-        using (UnityWebRequest request =
-               UnityWebRequest.Post(apiUrl, form))
+        if (apiClient == null)
         {
-            yield return request.SendWebRequest();
+            SetStatus("Voice saved, but AllTalk client is missing");
+            FinishSavingVoice();
+            yield break;
+        }
 
-            if (request.result != UnityWebRequest.Result.Success)
-            {
-                Debug.LogError(
-                    "AllTalk generation request failed: "
-                    + request.error
-                    + "\nResponse: "
-                    + request.downloadHandler.text
-                );
-                yield break;
-            }
+        bool reloadSucceeded = false;
+        string reloadMessage = null;
+        yield return apiClient.ReloadConfig((success, message) =>
+        {
+            reloadSucceeded = success;
+            reloadMessage = message;
+        });
 
-            string json = request.downloadHandler.text;
-            Debug.Log("AllTalk response: " + json);
+        if (!reloadSucceeded)
+        {
+            Debug.LogError("Voice was saved locally, but AllTalk config reload failed: " + reloadMessage);
+            SetStatus("Saved locally; AllTalk reload failed");
+            FinishSavingVoice();
+            yield break;
+        }
 
-            AllTalkTTSResponse response =
-                JsonUtility.FromJson<AllTalkTTSResponse>(json);
+        bool available = false;
+        yield return apiClient.CheckVoiceAvailability(voiceFileName, result => available = result);
+        UpdateVoiceAvailabilityStatus(available);
 
-            if (response == null ||
-                response.status != "generate-success" ||
-                string.IsNullOrEmpty(response.output_file_url))
-            {
-                Debug.LogError(
-                    "AllTalk did not return a valid audio URL. "
-                    + "Response: " + json
-                );
-                yield break;
-            }
+        if (available)
+        {
+            Debug.Log("AllTalk voice refreshed and available.");
+        }
+        else
+        {
+            Debug.LogWarning("The file was saved and AllTalk was refreshed, but the voice was not found in /api/voices.");
+        }
 
-            // 3. Die URL zur echten WAV-Datei bestimmen.
-            string audioUrl;
+        FinishSavingVoice();
+    }
 
-            if (response.output_file_url.StartsWith(
-                    "http://",
-                    System.StringComparison.OrdinalIgnoreCase) ||
-                response.output_file_url.StartsWith(
-                    "https://",
-                    System.StringComparison.OrdinalIgnoreCase))
-            {
-                audioUrl = response.output_file_url;
-            }
-            else
-            {
-                audioUrl = baseUrl + "/"
-                    + response.output_file_url.TrimStart('/');
-            }
+    private IEnumerator CheckVoiceAvailabilityRoutine()
+    {
+        bool available = false;
+        yield return apiClient.CheckVoiceAvailability(voiceFileName, result => available = result);
+        UpdateVoiceAvailabilityStatus(available);
+    }
 
-            Debug.Log("Downloading TTS audio: " + audioUrl);
+    public void GenerateAndPlayTTS()
+    {
+        if (isRecording || isSavingVoice)
+        {
+            Debug.LogWarning("Finish recording and saving the voice before generating TTS.");
+            return;
+        }
 
-            // 4. Die WAV-Datei separat herunterladen und dekodieren.
-            using (UnityWebRequest audioRequest =
-                   UnityWebRequestMultimedia.GetAudioClip(
-                       audioUrl, AudioType.WAV))
-            {
-                yield return audioRequest.SendWebRequest();
+        if (textInputField == null || string.IsNullOrWhiteSpace(textInputField.text))
+        {
+            Debug.LogWarning("AllTalkUIController: Text field is empty.");
+            return;
+        }
 
-                if (audioRequest.result !=
-                    UnityWebRequest.Result.Success)
-                {
-                    Debug.LogError(
-                        "Failed to download/decode WAV: "
-                        + audioRequest.error
-                        + "\nURL: " + audioUrl
-                    );
-                    yield break;
-                }
+        if (ttsPlayer == null)
+        {
+            Debug.LogError("AllTalkUIController: Assign an AllTalkTTSPlayer component.");
+            return;
+        }
 
-                AudioClip clip =
-                    DownloadHandlerAudioClip.GetContent(audioRequest);
+        ttsPlayer.RequestAndPlayTTS(textInputField.text, voiceFileName, ttsLanguage);
+    }
 
-                if (clip == null)
-                {
-                    Debug.LogError(
-                        "AudioClip could not be decoded. URL: "
-                        + audioUrl
-                    );
-                    yield break;
-                }
+    private void InitializeMicrophone()
+    {
+        if (Microphone.devices.Length == 0)
+        {
+            isMicrophoneInitialized = false;
+            Debug.LogError("No microphone device found on this system.");
+            return;
+        }
 
-                // 5. Das erzeugte Audio abspielen.
-                audioSource.Stop();
-                audioSource.clip = clip;
-                audioSource.Play();
+        microphoneID = Microphone.devices[0];
+        isMicrophoneInitialized = true;
+        Debug.Log("Microphone found: " + microphoneID);
+    }
 
-                Debug.Log(
-                    "AllTalk TTS playing. Duration: "
-                    + clip.length + " seconds."
-                );
-            }
+    private void ConfigureRecordingUI()
+    {
+        if (recordButtonImage == null && recordButton != null)
+        {
+            recordButtonImage = recordButton.targetGraphic as Image;
+        }
+
+        if (recordButtonImage != null)
+        {
+            idleButtonColor = recordButtonImage.color;
+        }
+
+        if (recordingProgressSlider != null)
+        {
+            recordingProgressSlider.minValue = 0f;
+            recordingProgressSlider.maxValue = 1f;
+            recordingProgressSlider.value = 0f;
+            recordingProgressSlider.gameObject.SetActive(false);
+        }
+
+        UpdateRecordingButton(false);
+    }
+
+    private void UpdateRecordingButton(bool recording)
+    {
+        if (recordButtonLabel != null)
+        {
+            recordButtonLabel.text = recording ? recordingButtonLabelText : idleButtonLabel;
+        }
+
+        if (recordButtonImage != null)
+        {
+            recordButtonImage.color = recording ? recordingButtonColor : idleButtonColor;
+        }
+
+        if (recordButton != null && !isSavingVoice)
+        {
+            recordButton.interactable = true;
         }
     }
 
+    private void FinishSavingVoice()
+    {
+        isSavingVoice = false;
+        if (recordButton != null) recordButton.interactable = true;
+    }
+
+    private void UpdateVoiceAvailabilityStatus(bool available)
+    {
+        SetStatus(available ? "Available" : "Unavailable");
+    }
+
+    private void SetStatus(string message)
+    {
+        if (statusText != null)
+        {
+            statusText.text = message;
+        }
+    }
+
+    private void OnDestroy()
+    {
+        if (recordButton != null)
+        {
+            recordButton.onClick.RemoveListener(ToggleRecording);
+        }
+
+        if (generateTTSButton != null)
+        {
+            generateTTSButton.onClick.RemoveListener(GenerateAndPlayTTS);
+        }
+
+        if (isRecording && !string.IsNullOrEmpty(microphoneID) && Microphone.IsRecording(microphoneID))
+        {
+            Microphone.End(microphoneID);
+        }
+
+        if (recordedAudio != null)
+        {
+            Destroy(recordedAudio);
+        }
+    }
 }
