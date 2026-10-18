@@ -16,10 +16,17 @@ public class AllTalkUIController : MonoBehaviour
     public AllTalkApiClient apiClient;
     public AllTalkTTSPlayer ttsPlayer;
 
+    /// <summary>
+    /// Invoked after the recorded voice has been saved, the AllTalk config reloaded,
+    /// and the new voice confirmed available through /api/voices.
+    /// Separate components can subscribe without adding their logic to this controller.
+    /// </summary>
+    public event Action<string> VoiceSavedAndAvailable;
+
     [Header("Voice Settings")]
     public string voiceFileName = "unity.wav";
     public string localVoicesFolderPath = @"C:\alltalk_tts\voices\";
-    public string ttsLanguage = "de";
+    public string ttsLanguage = "en";
 
     [Header("UI Components")]
     public Button recordButton;
@@ -60,7 +67,7 @@ public class AllTalkUIController : MonoBehaviour
 
     private void Start()
     {
-        InitializeMicrophone();
+        // Delay microphone initialization until recording is actually requested to avoid VR startup freezes.
         ConfigureRecordingUI();
 
         if (recordButton != null)
@@ -122,6 +129,11 @@ public class AllTalkUIController : MonoBehaviour
 
     public void StartRecording()
     {
+        if (!isMicrophoneInitialized)
+        {
+            InitializeMicrophone();
+        }
+
         if (!isMicrophoneInitialized || string.IsNullOrEmpty(microphoneID))
         {
             SetStatus("No microphone available");
@@ -322,6 +334,7 @@ public class AllTalkUIController : MonoBehaviour
         if (available)
         {
             Debug.Log("AllTalk voice refreshed and available.");
+            VoiceSavedAndAvailable?.Invoke(voiceFileName);
         }
         else
         {
@@ -337,6 +350,7 @@ public class AllTalkUIController : MonoBehaviour
         yield return apiClient.CheckVoiceAvailability(voiceFileName, result => available = result);
         UpdateVoiceAvailabilityStatus(available);
     }
+
 
     public void GenerateAndPlayTTS()
     {
@@ -456,5 +470,6 @@ public class AllTalkUIController : MonoBehaviour
         {
             Destroy(recordedAudio);
         }
+
     }
 }

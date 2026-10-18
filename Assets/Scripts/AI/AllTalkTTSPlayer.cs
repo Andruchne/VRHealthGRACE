@@ -12,8 +12,8 @@ public class AllTalkTTSPlayer : MonoBehaviour
     public AudioSource audioSource;
 
     [Header("Default TTS Settings")]
-    public string defaultVoiceFileName = "Bla.wav";
-    public string defaultLanguage = "de";
+    public string defaultVoiceFileName = "unity.wav";
+    public string defaultLanguage = "en";
     [Range(0.1f, 1.0f)] public float temperature = 0.45f;
     [Min(0.1f)] public float speed = 1.0f;
 
